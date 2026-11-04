@@ -68,6 +68,7 @@ func init() {
 	internal.TimeUntilFunc = time.Until
 	internal.NewNetResolver = newNetResolver
 	internal.AddressDialer = addressDialer
+	internal.IPv6LoopbackAvailable = ipv6LoopbackAvailable
 }
 
 const (
@@ -106,6 +107,21 @@ var newNetResolver = func(authority string) (internal.NetResolver, error) {
 		Dial:     internal.AddressDialer(authorityWithPort),
 	}, nil
 }
+
+// ipv6LoopbackAvailable reports whether an IPv6 socket can be bound to the
+// loopback address [::1]. This is the same check gRPC C-core uses to decide
+// whether to query for AAAA records: if it fails (e.g. IPv6 is disabled on the
+// host or in the container's network namespace), connections to IPv6 addresses
+// cannot succeed. The result is computed once per process.
+var ipv6LoopbackAvailable = sync.OnceValue(func() bool {
+	c, err := net.ListenPacket("udp6", "[::1]:0")
+	if err != nil {
+		logger.Infof("IPv6 loopback is not available, IPv6 addresses from DNS will be ignored: %v", err)
+		return false
+	}
+	c.Close()
+	return true
+})
 
 // NewBuilder creates a dnsBuilder which is used to factory DNS resolvers.
 func NewBuilder() resolver.Builder {
@@ -324,16 +340,33 @@ func (d *dnsResolver) lookupHost(ctx context.Context) ([]resolver.Address, error
 		err = handleDNSError(err, "A")
 		return nil, err
 	}
+	// If the host can't use IPv6, connections to IPv6 addresses can never
+	// succeed. Drop them so that LB policies that connect to every endpoint
+	// (e.g. round_robin) don't keep retrying them.
+	ipv6Available := internal.IPv6LoopbackAvailable()
 	newAddrs := make([]resolver.Address, 0, len(addrs))
 	for _, a := range addrs {
 		ip, err := formatIP(a)
 		if err != nil {
 			return nil, fmt.Errorf("dns: error parsing A record IP address %v: %v", a, err)
 		}
+		if !ipv6Available && !isIPv4(a) {
+			continue
+		}
 		addr := ip + ":" + d.port
 		newAddrs = append(newAddrs, resolver.Address{Addr: addr})
 	}
+	if len(addrs) > 0 && len(newAddrs) == 0 {
+		return nil, fmt.Errorf("dns: %q resolved only to IPv6 addresses, but IPv6 is not available on this host", d.host)
+	}
 	return newAddrs, nil
+}
+
+// isIPv4 reports whether addr, a valid textual representation of an IP address,
+// is an IPv4 or IPv4-mapped IPv6 address.
+func isIPv4(addr string) bool {
+	ip, err := netip.ParseAddr(addr)
+	return err == nil && ip.Unmap().Is4()
 }
 
 func (d *dnsResolver) lookup() (*resolver.State, error) {

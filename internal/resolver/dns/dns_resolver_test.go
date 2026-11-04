@@ -69,6 +69,14 @@ func overrideNetResolver(t *testing.T, r *testNetResolver) {
 	t.Cleanup(func() { dnsinternal.NewNetResolver = origNetResolver })
 }
 
+// Override the check used by the DNS resolver to determine whether the host can
+// use IPv6.
+func overrideIPv6LoopbackAvailable(t *testing.T, available bool) {
+	orig := dnsinternal.IPv6LoopbackAvailable
+	dnsinternal.IPv6LoopbackAvailable = func() bool { return available }
+	t.Cleanup(func() { dnsinternal.IPv6LoopbackAvailable = orig })
+}
+
 // Override the DNS minimum resolution interval used by the resolver.
 func overrideResolutionInterval(t *testing.T, d time.Duration) {
 	origMinResInterval := dns.MinResolutionInterval
@@ -565,6 +573,84 @@ func (s) TestDNSResolver_Basic(t *testing.T) {
 			defer cancel()
 			verifyUpdateFromResolver(ctx, t, stateCh, test.want)
 		})
+	}
+}
+
+// Tests that IPv6 addresses returned by name resolution are only included in
+// the update pushed to the channel when the host can use IPv6.
+func (s) TestDNSResolver_IPv6Availability(t *testing.T) {
+	const target = "foo.bar.com"
+	hostLookupTable := map[string][]string{
+		target: {"1.2.3.4", "2607:f8b0:400a:801::1001", "::ffff:5.6.7.8", "2607:f8b0:400a:801::1002"},
+	}
+	tests := []struct {
+		name          string
+		ipv6Available bool
+		wantAddrs     []resolver.Address
+	}{
+		{
+			name:          "ipv6_available",
+			ipv6Available: true,
+			wantAddrs: []resolver.Address{
+				{Addr: "1.2.3.4" + colonDefaultPort},
+				{Addr: "[2607:f8b0:400a:801::1001]" + colonDefaultPort},
+				{Addr: "[::ffff:5.6.7.8]" + colonDefaultPort},
+				{Addr: "[2607:f8b0:400a:801::1002]" + colonDefaultPort},
+			},
+		},
+		{
+			name:          "ipv6_unavailable",
+			ipv6Available: false,
+			wantAddrs: []resolver.Address{
+				{Addr: "1.2.3.4" + colonDefaultPort},
+				{Addr: "[::ffff:5.6.7.8]" + colonDefaultPort},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			overrideTimeAfterFunc(t, 2*defaultTestTimeout)
+			overrideNetResolver(t, &testNetResolver{hostLookupTable: hostLookupTable})
+			overrideIPv6LoopbackAvailable(t, test.ipv6Available)
+			_, stateCh, _ := buildResolverWithTestClientConn(t, target)
+
+			var wantEndpoints []resolver.Endpoint
+			for _, a := range test.wantAddrs {
+				wantEndpoints = append(wantEndpoints, resolver.Endpoint{Addresses: []resolver.Address{a}})
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+			verifyUpdateFromResolver(ctx, t, stateCh, resolverUpdate{addrs: test.wantAddrs, endpoints: wantEndpoints})
+		})
+	}
+}
+
+// Tests that when a name resolves only to IPv6 addresses and the host can't use
+// IPv6, the DNS resolver reports an error to the channel instead of pushing an
+// update with no addresses.
+func (s) TestDNSResolver_IPv6Unavailable_OnlyIPv6Addresses(t *testing.T) {
+	overrideTimeAfterFunc(t, 2*defaultTestTimeout)
+	const target = "ipv6.only.fake"
+	overrideNetResolver(t, &testNetResolver{
+		hostLookupTable: map[string][]string{
+			target: {"2607:f8b0:400a:801::1001", "2607:f8b0:400a:801::1002"},
+		},
+	})
+	overrideIPv6LoopbackAvailable(t, false)
+	_, stateCh, errCh := buildResolverWithTestClientConn(t, target)
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		t.Fatal("Timeout when waiting for an error from the resolver")
+	case err := <-errCh:
+		if !strings.Contains(err.Error(), "IPv6 is not available") {
+			t.Fatalf("ReportError(err=%v) called; want err containing %q", err, "IPv6 is not available")
+		}
+	case state := <-stateCh:
+		t.Fatalf("UpdateState(%+v) called; want ReportError", state)
 	}
 }
 

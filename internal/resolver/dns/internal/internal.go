@@ -74,4 +74,9 @@ var (
 	// Host portion of the URL corresponding to the user's dial target and
 	// returns a dial function.
 	AddressDialer func(address string) func(context.Context, string, string) (net.Conn, error)
+
+	// IPv6LoopbackAvailable reports whether the host can use IPv6. The DNS
+	// resolver ignores IPv6 addresses returned by name resolution when this
+	// returns false.
+	IPv6LoopbackAvailable func() bool
 )
